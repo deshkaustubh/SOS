@@ -61,9 +61,23 @@ jobs:
           name: app-release-apk
           path: ./release-apk
 
+      # Auto-generate a version tag based on run number
+      - name: Create Git Tag
+        run: |
+          TAG="v1.0.${{ github.run_number }}"
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
+          git tag $TAG
+          git push origin $TAG
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Create GitHub Release with APK attached
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: "Release v1.0.${{ github.run_number }}"
           files: ./release-apk/*.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
