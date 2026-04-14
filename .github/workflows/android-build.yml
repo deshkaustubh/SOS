@@ -1,28 +1,35 @@
 name: Android CI/CD
 
+# Allow workflow to push tags and create releases
+permissions:
+  contents: write
+
 on:
   push:
     branches: [ "master" ]
   pull_request:
   workflow_dispatch:
 
+env:
+  # Adjust module path if your app module is not named "app"
+  APP_MODULE: app
+
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      # Checkout source code
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # required for tagging and pushing tags later
 
-      # Set up JDK (required for Gradle)
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      # Cache Gradle dependencies
       - name: Cache Gradle
         uses: actions/cache@v3
         with:
@@ -33,27 +40,52 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      # Fix Gradle wrapper permissions
       - name: Grant execute permission for Gradlew
-        run: chmod +x gradlew
+        run: chmod +x ./gradlew
 
-      # Build APK
-      - name: Build with Gradle
-        run: ./gradlew assembleRelease
+      - name: Accept Android SDK licenses (if needed)
+        if: runner.os == 'Linux'
+        run: |
+          yes | ./gradlew -q --no-daemon --console=plain --stacktrace --warning-mode=all help >/dev/null || true
 
-      # Upload artifact for debugging (optional)
-      - name: Upload APK
+      - name: Build APK (release) and AAB (bundle)
+        run: |
+          set -e
+          ./gradlew clean
+          ./gradlew :${{ env.APP_MODULE }}:assembleRelease --no-daemon --stacktrace
+          ./gradlew :${{ env.APP_MODULE }}:bundleRelease --no-daemon --stacktrace || echo "AAB build failed or not configured; continuing"
+
+      - name: List build outputs
+        run: |
+          echo "APK outputs:"
+          ls -la ./${{ env.APP_MODULE }}/build/outputs/apk/release || true
+          echo "AAB outputs:"
+          ls -la ./${{ env.APP_MODULE }}/build/outputs/bundle/release || true
+
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: app-release-apk
-          path: app/build/outputs/apk/release/*.apk
+          path: ${{ env.APP_MODULE }}/build/outputs/apk/release/*.apk
+
+      - name: Upload AAB artifact (if produced)
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-aab
+          path: ${{ env.APP_MODULE }}/build/outputs/bundle/release/*.aab
 
   release:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
     steps:
-      - name: Checkout
+      - name: Checkout (full history)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
 
       - name: Download APK artifact
         uses: actions/download-artifact@v4
@@ -61,23 +93,81 @@ jobs:
           name: app-release-apk
           path: ./release-apk
 
-      # Auto-generate a version tag based on run number
-      - name: Create Git Tag
+      - name: Download AAB artifact (if any)
+        uses: actions/download-artifact@v4
+        with:
+          name: app-release-aab
+          path: ./release-aab
+        continue-on-error: true
+
+      - name: Determine release tag from Gradle (versionName) or fallback
+        id: tag
         run: |
-          TAG="v1.0.${{ github.run_number }}"
-          git config --global user.name "github-actions"
-          git config --global user.email "github-actions@github.com"
-          git tag $TAG
-          git push origin $TAG
+          set -e
+          # Try gradle properties first
+          TAG=""
+          # 1) Try gradle.properties (common place)
+          if [ -f gradle.properties ]; then
+            VERSION_NAME=$(grep -E '^VERSION_NAME|^versionName' gradle.properties | head -n1 | sed -E 's/.*=//; s/[" ]//g' || true)
+            if [ -n "$VERSION_NAME" ]; then
+              TAG="v${VERSION_NAME}"
+            fi
+          fi
+
+          # 2) Try app module build.gradle (Groovy) for versionName "x.y.z"
+          if [ -z "$TAG" ] && [ -f "${{ env.APP_MODULE }}/build.gradle" ]; then
+            VERSION_NAME=$(grep -E 'versionName\s+["'\'']'${1}'["'\'']' "${{ env.APP_MODULE }}/build.gradle" 2>/dev/null || true)
+            VERSION_NAME=$(grep -E 'versionName' "${{ env.APP_MODULE }}/build.gradle" | head -n1 | sed -E 's/.*versionName[[:space:]]*["'\'']([^"'\'']+)["'\''].*/\1/' || true)
+            if [ -n "$VERSION_NAME" ]; then
+              TAG="v${VERSION_NAME}"
+            fi
+          fi
+
+          # 3) Try Kotlin DSL build.gradle.kts
+          if [ -z "$TAG" ] && [ -f "${{ env.APP_MODULE }}/build.gradle.kts" ]; then
+            VERSION_NAME=$(grep -E 'versionName\\s*=' "${{ env.APP_MODULE }}/build.gradle.kts" | head -n1 | sed -E 's/.*versionName\\s*=\\s*["'\'']([^"'\'']+)["'\''].*/\1/' || true)
+            if [ -n "$VERSION_NAME" ]; then
+              TAG="v${VERSION_NAME}"
+            fi
+          fi
+
+          # 4) Fallback to run number
+          if [ -z "$TAG" ]; then
+            TAG="v1.0.${{ github.run_number }}"
+          fi
+
+          echo "Determined tag: $TAG"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Create and push tag (authenticated)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TAG=${{ steps.tag.outputs.tag }}
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Create tag if it doesn't already exist
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists locally."
+          else
+            git tag "$TAG"
+          fi
+          # Push tag using token-authenticated URL to avoid permission issues
+          REPO_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
+          git push --follow-tags "$REPO_URL" "refs/tags/$TAG"
+
+      - name: Create GitHub Release and upload artifacts
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "Release ${{ steps.tag.outputs.tag }}"
+          files: |
+            ./release-apk/*.apk
+            ./release-aab/*.aab
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # Create GitHub Release with APK attached
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: v1.0.${{ github.run_number }}
-          name: "Release v1.0.${{ github.run_number }}"
-          files: ./release-apk/*.apk
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Output release URL
+        run: |
+          echo "Release created for tag ${{ steps.tag.outputs.tag }}. Check Releases in the repository."
